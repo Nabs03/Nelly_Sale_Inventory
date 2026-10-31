@@ -2,7 +2,7 @@ import express from "express"
 
 import cors from "cors"
 
-import Database from "better-sqlite3"
+import { createClient } from "@libsql/client"
 
 import fs from "fs"
 
@@ -150,11 +150,39 @@ const toFiniteNumber = (value) => {
   return Number(value)
 }
 
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
+if (!process.env.TURSO_DATABASE_URL) {
+  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
+}
 
-const db = new Database(DB_PATH)
+if (process.env.TURSO_DATABASE_URL && !process.env.TURSO_AUTH_TOKEN) {
+  throw new Error("TURSO_AUTH_TOKEN is required with TURSO_DATABASE_URL.")
+}
 
-db.exec(`
+if (process.env.VERCEL && !process.env.TURSO_DATABASE_URL) {
+  throw new Error("TURSO_DATABASE_URL is required for Vercel deployments.")
+}
+
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL || `file:${DB_PATH}`,
+  ...(process.env.TURSO_AUTH_TOKEN
+    ? { authToken: process.env.TURSO_AUTH_TOKEN }
+    : {}),
+})
+
+const withWriteTransaction = async (operation) => {
+  const transaction = await db.transaction("write")
+
+  try {
+    const result = await operation(transaction)
+    await transaction.commit()
+    return result
+  } catch (error) {
+    await transaction.rollback()
+    throw error
+  }
+}
+
+await db.execute(`
   CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -165,8 +193,10 @@ db.exec(`
     stock INTEGER NOT NULL,
     sold INTEGER NOT NULL DEFAULT 0,
     color TEXT NOT NULL
-  );
+  )
+`)
 
+await db.execute(`
   CREATE TABLE IF NOT EXISTS sales (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     productId INTEGER NOT NULL,
@@ -174,102 +204,107 @@ db.exec(`
     quantity INTEGER NOT NULL,
     total REAL NOT NULL,
     date TEXT NOT NULL
-  );
+  )
 `)
 
-const insertSeedData = db.prepare("SELECT COUNT(*) AS total FROM products")
+const productCount = Number(
+  (await db.execute("SELECT COUNT(*) AS total FROM products")).rows[0].total,
+)
 
-if (insertSeedData.get().total === 0) {
-  const seedProducts = db.prepare(`
-    INSERT INTO products (name, sku, category, price, cost, stock, sold, color)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `)
-
-  const seedSales = db.prepare(`
-    INSERT INTO sales (productId, productName, quantity, total, date)
-    VALUES (?, ?, ?, ?, ?)
-  `)
-
-  db.transaction(() => {
+if (
+  productCount === 0 &&
+  !process.env.TURSO_DATABASE_URL &&
+  process.env.SEED_STARTER_DATA === "true"
+) {
+  await withWriteTransaction(async (transaction) => {
     for (const product of starterProducts) {
-      const result = seedProducts.run(
-        product.name,
-        product.sku,
-        product.category,
-        product.price,
-        product.cost,
-        product.stock,
-        product.sold,
-        product.color,
-      )
-
-      if (product.id === 1) {
-        // keep original product ids for existing sales references
-      }
+      await transaction.execute({
+        sql: `
+          INSERT INTO products (name, sku, category, price, cost, stock, sold, color)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        args: [
+          product.name,
+          product.sku,
+          product.category,
+          product.price,
+          product.cost,
+          product.stock,
+          product.sold,
+          product.color,
+        ],
+      })
     }
 
     for (const sale of starterSales) {
-      seedSales.run(
-        sale.productId,
-        sale.productName,
-        sale.quantity,
-        sale.total,
-        sale.date,
-      )
+      await transaction.execute({
+        sql: `
+          INSERT INTO sales (productId, productName, quantity, total, date)
+          VALUES (?, ?, ?, ?, ?)
+        `,
+        args: [
+          sale.productId,
+          sale.productName,
+          sale.quantity,
+          sale.total,
+          sale.date,
+        ],
+      })
     }
-  })()
+  })
 }
 
-db.transaction(() => {
-  const legacyProduct = db.prepare("SELECT id FROM products WHERE sku = ?")
+if (!process.env.TURSO_DATABASE_URL) {
+  await withWriteTransaction(async (transaction) => {
+    for (const [index, product] of starterProducts.entries()) {
+      const legacy = legacyProducts[index]
 
-  const conflictingSku = db.prepare(
-    "SELECT id FROM products WHERE sku = ? AND id != ?",
-  )
+      await transaction.execute({
+        sql: "UPDATE sales SET productName = ? WHERE productName = ?",
+        args: [product.name, legacy.previousName],
+      })
 
-  const updateProduct = db.prepare(`
-    UPDATE products SET name = ?, sku = ?, category = ?, color = ? WHERE id = ?
-  `)
+      const existing = (
+        await transaction.execute({
+          sql: "SELECT id FROM products WHERE sku = ?",
+          args: [legacy.sku],
+        })
+      ).rows[0]
 
-  const updateSales = db.prepare(
-    "UPDATE sales SET productName = ? WHERE productName = ?",
-  )
+      if (!existing) continue
 
-  starterProducts.forEach((product, index) => {
-    const legacy = legacyProducts[index]
+      const conflictingSku = (
+        await transaction.execute({
+          sql: "SELECT id FROM products WHERE sku = ? AND id != ?",
+          args: [product.sku, existing.id],
+        })
+      ).rows[0]
+      const sku = conflictingSku
+        ? `${product.sku}-${Number(existing.id)}`
+        : product.sku
 
-    updateSales.run(product.name, legacy.previousName)
+      await transaction.execute({
+        sql: `
+          UPDATE products SET name = ?, sku = ?, category = ?, color = ? WHERE id = ?
+        `,
+        args: [product.name, sku, product.category, product.color, existing.id],
+      })
+    }
 
-    const existing = legacyProduct.get(legacy.sku)
-
-    if (!existing) return
-
-    const sku = conflictingSku.get(product.sku, existing.id)
-      ? `${product.sku}-${existing.id}`
-      : product.sku
-
-    updateProduct.run(
-      product.name,
-      sku,
-      product.category,
-      product.color,
-      existing.id,
-    )
+    await transaction.execute(`
+      UPDATE products
+      SET category = CASE
+        WHEN sku = 'BIG' THEN 'Big Pasta'
+        WHEN sku IN ('CAK-1042', 'CAK-2214') THEN 'Ice cream Cakes'
+        ELSE 'Desserts'
+      END
+      WHERE category NOT IN ('Big Pasta', 'Small Pasta', 'Ice cream Cakes', 'Desserts')
+    `)
   })
-
-  db.prepare(`
-    UPDATE products
-    SET category = CASE
-      WHEN sku = 'BIG' THEN 'Big Pasta'
-      WHEN sku IN ('CAK-1042', 'CAK-2214') THEN 'Ice cream Cakes'
-      ELSE 'Desserts'
-    END
-    WHERE category NOT IN ('Big Pasta', 'Small Pasta', 'Ice cream Cakes', 'Desserts')
-  `).run()
-})()
+}
 
 const productRowToObject = (row) => ({
-  id: row.id,
+  id: Number(row.id),
 
   name: row.name,
 
@@ -310,22 +345,19 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, message: "Inventory API is running" })
 })
 
-app.get("/api/products", (_req, res) => {
-  const products = db
-    .prepare("SELECT * FROM products ORDER BY id DESC")
-    .all()
-    .map(productRowToObject)
+app.get("/api/products", async (_req, res) => {
+  const { rows } = await db.execute("SELECT * FROM products ORDER BY id DESC")
 
-  res.json(products)
+  res.json(rows.map(productRowToObject))
 })
 
-app.delete("/api/products", (_req, res) => {
-  const result = db.prepare("DELETE FROM products").run()
+app.delete("/api/products", async (_req, res) => {
+  const result = await db.execute("DELETE FROM products")
 
-  res.json({ success: true, removed: result.changes })
+  res.json({ success: true, removed: result.rowsAffected })
 })
 
-app.post("/api/products", (req, res) => {
+app.post("/api/products", async (req, res) => {
   const payload = req.body || {}
 
   const name = typeof payload.name === "string" ? payload.name.trim() : ""
@@ -351,11 +383,6 @@ app.post("/api/products", (req, res) => {
     return res.status(400).json({ message: "Valid product data is required." })
   }
 
-  const insertProduct = db.prepare(`
-    INSERT INTO products (name, sku, category, price, cost, stock, sold, color)
-    VALUES (?, ?, ?, ?, ?, ?, 0, ?)
-  `)
-
   const colorList = [
     "#e8e0ff",
     "#d9f1eb",
@@ -365,10 +392,12 @@ app.post("/api/products", (req, res) => {
     "#fff0c7",
   ]
 
-  const createProduct = db.transaction(() => {
-    const total = db
-      .prepare("SELECT COUNT(*) AS total FROM products")
-      .get().total
+  const row = await withWriteTransaction(async (transaction) => {
+    const total = Number(
+      (
+        await transaction.execute("SELECT COUNT(*) AS total FROM products")
+      ).rows[0].total,
+    )
     const product = {
       name,
       sku: `PRD-${String(total + 1).padStart(4, "0")}`,
@@ -379,60 +408,69 @@ app.post("/api/products", (req, res) => {
       color: colorList[total % colorList.length],
     }
 
-    const info = insertProduct.run(
-      product.name,
-      product.sku,
-      product.category,
-      product.price,
-      product.cost,
-      product.stock,
-      product.color,
-    )
+    const info = await transaction.execute({
+      sql: `
+        INSERT INTO products (name, sku, category, price, cost, stock, sold, color)
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+      `,
+      args: [
+        product.name,
+        product.sku,
+        product.category,
+        product.price,
+        product.cost,
+        product.stock,
+        product.color,
+      ],
+    })
 
-    return db
-      .prepare("SELECT * FROM products WHERE id = ?")
-      .get(info.lastInsertRowid)
+    return (
+      await transaction.execute({
+        sql: "SELECT * FROM products WHERE id = ?",
+        args: [info.lastInsertRowid],
+      })
+    ).rows[0]
   })
-
-  const row = createProduct()
 
   res.status(201).json(productRowToObject(row))
 })
 
-app.delete("/api/products/:id", (req, res) => {
+app.delete("/api/products/:id", async (req, res) => {
   const id = Number(req.params.id)
 
-  const existing = db.prepare("SELECT * FROM products WHERE id = ?").get(id)
+  const existing = (
+    await db.execute({
+      sql: "SELECT * FROM products WHERE id = ?",
+      args: [id],
+    })
+  ).rows[0]
 
   if (!existing) {
     return res.status(404).json({ message: "Product not found." })
   }
 
-  db.prepare("DELETE FROM products WHERE id = ?").run(id)
+  await db.execute({ sql: "DELETE FROM products WHERE id = ?", args: [id] })
 
   res.json({ success: true, removed: existing.name })
 })
 
-app.get("/api/sales", (_req, res) => {
-  const sales = db
-    .prepare("SELECT * FROM sales ORDER BY id DESC")
-    .all()
-    .map(saleRowToObject)
+app.get("/api/sales", async (_req, res) => {
+  const { rows } = await db.execute("SELECT * FROM sales ORDER BY id DESC")
 
-  res.json(sales)
+  res.json(rows.map(saleRowToObject))
 })
 
-app.delete("/api/sales", (_req, res) => {
-  const resetSalesHistory = db.transaction(() => {
-    const result = db.prepare("DELETE FROM sales").run()
-    db.prepare("UPDATE products SET sold = 0").run()
-    return result.changes
+app.delete("/api/sales", async (_req, res) => {
+  const removed = await withWriteTransaction(async (transaction) => {
+    const result = await transaction.execute("DELETE FROM sales")
+    await transaction.execute("UPDATE products SET sold = 0")
+    return result.rowsAffected
   })
 
-  res.json({ success: true, removed: resetSalesHistory() })
+  res.json({ success: true, removed })
 })
 
-app.post("/api/sales", (req, res) => {
+app.post("/api/sales", async (req, res) => {
   const payload = req.body || {}
 
   const productId = toFiniteNumber(payload.productId)
@@ -448,53 +486,75 @@ app.post("/api/sales", (req, res) => {
     return res.status(400).json({ message: "Valid sale data is required." })
   }
 
-  const product = db
-    .prepare("SELECT * FROM products WHERE id = ?")
-    .get(productId)
+  const outcome = await withWriteTransaction(async (transaction) => {
+    const product = (
+      await transaction.execute({
+        sql: "SELECT * FROM products WHERE id = ?",
+        args: [productId],
+      })
+    ).rows[0]
 
-  if (!product) {
-    return res.status(404).json({ message: "Product not found." })
+    if (!product) {
+      return { status: 404, message: "Product not found." }
+    }
+
+    const saleQty = quantity
+
+    if (saleQty > Number(product.stock)) {
+      return {
+        status: 400,
+        message: "Requested quantity exceeds available stock.",
+      }
+    }
+
+    const total = Number(product.price) * saleQty
+
+    if (!Number.isFinite(total)) {
+      return {
+        status: 400,
+        message: "Sale total is outside the supported range.",
+      }
+    }
+
+    await transaction.execute({
+      sql: "UPDATE products SET stock = stock - ?, sold = sold + ? WHERE id = ?",
+      args: [saleQty, saleQty, product.id],
+    })
+
+    await transaction.execute({
+      sql: `
+        INSERT INTO sales (productId, productName, quantity, total, date)
+        VALUES (?, ?, ?, ?, ?)
+      `,
+      args: [
+        product.id,
+        product.name,
+        saleQty,
+        total,
+        new Date().toISOString(),
+      ],
+    })
+
+    const sale = (
+      await transaction.execute(
+        "SELECT * FROM sales ORDER BY id DESC LIMIT 1",
+      )
+    ).rows[0]
+
+    return { sale }
+  })
+
+  if ("message" in outcome) {
+    return res.status(outcome.status).json({ message: outcome.message })
   }
 
-  const saleQty = quantity
-
-  if (saleQty > Number(product.stock)) {
-    return res
-      .status(400)
-      .json({ message: "Requested quantity exceeds available stock." })
-  }
-
-  const total = Number(product.price) * saleQty
-
-  if (!Number.isFinite(total)) {
-    return res
-      .status(400)
-      .json({ message: "Sale total is outside the supported range." })
-  }
-
-  db.transaction(() => {
-    db.prepare(
-      "UPDATE products SET stock = stock - ?, sold = sold + ? WHERE id = ?",
-    ).run(saleQty, saleQty, product.id)
-
-    const result = db.prepare(
-      "INSERT INTO sales (productId, productName, quantity, total, date) VALUES (?, ?, ?, ?, ?)",
-    )
-
-    result.run(
-      product.id,
-      product.name,
-      saleQty,
-      total,
-      new Date().toISOString(),
-    )
-  })()
-
-  const sale = db.prepare("SELECT * FROM sales ORDER BY id DESC LIMIT 1").get()
-
-  res.status(201).json(saleRowToObject(sale))
+  res.status(201).json(saleRowToObject(outcome.sale))
 })
 
-app.listen(PORT, () => {
-  console.log(`Inventory backend running at http://localhost:${PORT}`)
-})
+export default app
+
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  app.listen(PORT, () => {
+    console.log(`Inventory backend running at http://localhost:${PORT}`)
+  })
+}
