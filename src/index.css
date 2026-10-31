@@ -1,0 +1,132 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap');
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'DM Sans', sans-serif;
+  --font-display: 'Manrope', sans-serif;
+}
+
+@layer base {
+  body {
+    min-width: 320px;
+    min-height: 100vh;
+    background: #f4f6f4;
+    color: #18322d;
+    font-family: var(--font-sans);
+  }
+
+  button,
+  select {
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+}
+
+@layer components {
+  .panel {
+    border: 1px solid #e0e6e2;
+    border-radius: 1rem;
+    background: white;
+    box-shadow: 0 1px 2px rgb(25 61 52 / 0.02);
+  }
+
+  .primary-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: fit-content;
+    border-radius: 0.75rem;
+    background: #1d4f43;
+    padding: 0.7rem 1rem;
+    color: white;
+    font-size: 0.875rem;
+    font-weight: 700;
+    box-shadow: 0 5px 14px rgb(29 79 67 / 0.14);
+    transition: 160ms ease;
+  }
+
+  .primary-button:hover {
+    background: #163f35;
+    transform: translateY(-1px);
+  }
+
+  .secondary-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid #d7ded9;
+    border-radius: 0.75rem;
+    background: white;
+    padding: 0.7rem 1rem;
+    color: #54655f;
+    font-size: 0.875rem;
+    font-weight: 700;
+  }
+
+  .input {
+    width: 100%;
+    border: 1px solid #d9e0dc;
+    border-radius: 0.75rem;
+    background: white;
+    padding: 0.7rem 0.85rem;
+    color: #18322d;
+    font-size: 0.875rem;
+    outline: none;
+    transition: border-color 160ms ease, box-shadow 160ms ease;
+  }
+
+  .input:focus {
+    border-color: #4d806f;
+    box-shadow: 0 0 0 3px rgb(77 128 111 / 0.11);
+  }
+
+  .input::placeholder {
+    color: #a1aca7;
+  }
+
+  .input-prefix {
+    position: absolute;
+    left: 0.85rem;
+    top: 50%;
+    transform: translateY(-50%);
+    color: #788680;
+    font-size: 0.875rem;
+  }
+
+  .page-heading {
+    font-family: var(--font-display);
+    font-size: clamp(1.8rem, 3vw, 2.35rem);
+    line-height: 1.15;
+    font-weight: 700;
+    letter-spacing: -0.045em;
+  }
+
+  .page-subtitle {
+    margin-top: 0.5rem;
+    color: #71807b;
+    font-size: 0.875rem;
+  }
+}
+
+@keyframes enter {
+  from { opacity: 0; transform: translateY(7px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-in {
+  animation: enter 300ms ease both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

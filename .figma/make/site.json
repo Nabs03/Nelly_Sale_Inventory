@@ -1,0 +1,11 @@
+{
+  "title": "Sweet Crumb Bakery Inventory",
+  "description": "Manage cakes, pastries, cookies, and dessert stock, record sales, and track your bakery inventory from your phone.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
